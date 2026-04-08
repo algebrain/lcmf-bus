@@ -1,1 +1,6 @@
 .cpcache/
+.clojure/
+.m2/
+.shadow-cljs/
+.plans
+.codex

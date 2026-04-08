@@ -1,0 +1,7 @@
+{:source-paths ["src" "test"]
+ :builds
+ {:test
+  {:target :node-test
+   :output-to ".shadow-cljs/node-tests.js"
+   :ns-regexp "-test$"
+   :autorun true}}}

@@ -26,3 +26,9 @@ Core API:
 - `subscribe!`
 - `unsubscribe!`
 - `listener-count`
+
+Testing workflow:
+
+- `bb test.bb`
+- `clojure -M:test`
+- `clojure -M:test-watch`

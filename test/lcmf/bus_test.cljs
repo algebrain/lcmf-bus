@@ -1,6 +1,13 @@
 (ns lcmf.bus-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [cljs.test :refer-macros [deftest is]]
             [lcmf.bus :as bus]))
+
+(defn- thrown-ex [f]
+  (try
+    (f)
+    nil
+    (catch :default ex
+      ex)))
 
 (deftest publish-and-subscribe-test
   (let [app-bus (bus/make-bus)
@@ -20,11 +27,11 @@
     (is (= {:id "b-1"} (:payload @received)))))
 
 (deftest module-is-required-test
-  (let [app-bus (bus/make-bus)]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Missing required :module"
-         (bus/publish! app-bus :booking/created {} {})))))
+  (let [app-bus (bus/make-bus)
+        ex (thrown-ex #(bus/publish! app-bus :booking/created {} {}))]
+    (is (some? ex))
+    (is (= :missing-module (:reason (ex-data ex))))
+    (is (re-find #"Missing required :module" (ex-message ex)))))
 
 (deftest multiple-subscribers-and-error-isolation-test
   (let [app-bus (bus/make-bus)
@@ -60,34 +67,44 @@
 
 (deftest cycle-detection-test
   (let [app-bus (bus/make-bus)
-        root-envelope (bus/publish! app-bus :booking/created {:id "b-1"} {:module :booking})]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Cycle detected"
-         (bus/publish! app-bus
-                       :booking/created
-                       {:id "b-2"}
-                       {:module :booking
-                        :parent-envelope root-envelope})))))
+        root-envelope (bus/publish! app-bus :booking/created {:id "b-1"} {:module :booking})
+        ex (thrown-ex #(bus/publish! app-bus
+                                     :booking/created
+                                     {:id "b-2"}
+                                     {:module :booking
+                                      :parent-envelope root-envelope}))]
+    (is (some? ex))
+    (is (= :cycle-detected (:reason (ex-data ex))))
+    (is (re-find #"Cycle detected" (ex-message ex)))))
 
 (deftest max-depth-test
   (let [app-bus (bus/make-bus :max-depth 1)
         first-child (bus/publish! app-bus :event/one 1 {:module :m1})
-        second-child (bus/publish! app-bus :event/two 2 {:module :m2 :parent-envelope first-child})]
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"Max causation depth exceeded"
-         (bus/publish! app-bus :event/three 3 {:module :m3 :parent-envelope second-child})))))
+        second-child (bus/publish! app-bus :event/two 2 {:module :m2 :parent-envelope first-child})
+        ex (thrown-ex #(bus/publish! app-bus
+                                     :event/three
+                                     3
+                                     {:module :m3
+                                      :parent-envelope second-child}))]
+    (is (some? ex))
+    (is (= :max-depth-exceeded (:reason (ex-data ex))))
+    (is (re-find #"Max causation depth exceeded" (ex-message ex)))))
 
 (deftest unsubscribe-and-listener-count-test
   (let [app-bus (bus/make-bus)
         calls (atom 0)
-        id-1 (bus/subscribe! app-bus :event/inc (fn [_ _] (swap! calls inc)))
-        _id-2 (bus/subscribe! app-bus :event/inc (fn [_ _] (swap! calls inc)) {:meta {:slot :secondary}})]
+        handler-1 (fn [_ _] (swap! calls inc))
+        handler-2 (fn [_ _] (swap! calls inc))
+        id-1 (bus/subscribe! app-bus :event/inc handler-1)
+        _id-2 (bus/subscribe! app-bus :event/inc handler-2 {:meta {:slot :secondary}})]
     (is (= 2 (bus/listener-count app-bus :event/inc)))
     (is (= 2 (bus/listener-count app-bus)))
     (is (true? (bus/unsubscribe! app-bus :event/inc id-1)))
     (is (= 1 (bus/listener-count app-bus :event/inc)))
+    (is (false? (bus/unsubscribe! app-bus :event/inc handler-1)))
+    (is (true? (bus/unsubscribe! app-bus :event/inc handler-2)))
+    (is (= 0 (bus/listener-count app-bus :event/inc)))
+    (bus/subscribe! app-bus :event/inc handler-2 {:meta {:slot :secondary}})
     (is (true? (bus/unsubscribe! app-bus :event/inc {:slot :secondary})))
     (is (= 0 (bus/listener-count app-bus :event/inc)))
     (bus/publish! app-bus :event/inc nil {:module :test})
