@@ -3,25 +3,26 @@
 Этот документ описывает публичный интерфейс библиотеки
 [`lcmf-bus`](https://github.com/algebrain/lcmf-bus).
 
-Библиотека реализует app-level шину сообщений для
+Библиотека реализует общую шину сообщений уровня приложения для
 [`LCMF`](https://github.com/algebrain/lcmf-docs).
 
 ## Назначение
 
 `lcmf-bus` дает:
 
-- in-memory шину сообщений;
+- шину сообщений в памяти;
 - дисциплину конвертов;
 - обязательный `:module` при публикации;
 - продолжение причинно-следственной цепочки через `:parent-envelope`;
+- раннее отклонение ошибок на границе публичных функций;
 - изоляцию ошибок слушателей.
 
 Библиотека не включает:
 
-- persistent delivery;
-- buffering и backpressure;
+- устойчивую доставку после перезапуска;
+- буферизацию и управление обратным давлением;
 - транзакционную обработку;
-- worker pool;
+- пул рабочих потоков;
 - transport-адаптеры.
 
 ## Конверт сообщения
@@ -59,8 +60,11 @@
 
 Опции первой версии:
 
-- `:logger` — optional `(fn [level data] ...)`
-- `:max-depth` — optional ограничение длины `causation-path`
+- `:logger` — необязательная журналирующая функция `(fn [level data] ...)`
+- `:max-depth` — необязательное ограничение длины `causation-path`
+
+Если `:logger` передан, он должен быть функцией.
+Если `:max-depth` передан, он должен быть положительным целым числом.
 
 Пример:
 
@@ -91,7 +95,7 @@
 
 `opts` первой версии:
 
-- `:meta` — optional map для последующего `unsubscribe!`
+- `:meta` — необязательная карта для последующего `unsubscribe!`
 
 Возвращаемое значение:
 
@@ -120,8 +124,8 @@
 В `opts` первой версии важны:
 
 - `:module` — обязателен
-- `:parent-envelope` — optional, если сообщение производно от другого
-- `:correlation-id` — optional для root message
+- `:parent-envelope` — необязателен, если сообщение производно от другого
+- `:correlation-id` — необязателен для корневого сообщения
 
 Пример root message:
 
@@ -149,6 +153,56 @@
 - слушатели вызываются в рамках одного вызова `publish!`;
 - ошибка одного слушателя не останавливает остальных.
 
+## Проверка границы API
+
+Шина отклоняет некорректные аргументы сразу, до изменения состояния подписок
+или сборки нового конверта.
+
+Единый вид ошибки аргумента:
+
+```clojure
+(throw (ex-info "Invalid argument"
+                {:reason :invalid-argument
+                 :field :event-type
+                 :value "\"booking/created\""}))
+```
+
+Единый вид ошибки производного конверта:
+
+```clojure
+(throw (ex-info "Invalid parent envelope"
+                {:reason :invalid-parent-envelope
+                 :parent-envelope {:event-type :booking/created}}))
+```
+
+Проверки публичных функций:
+
+| Функция | Проверка |
+|---------|----------|
+| `make-bus` | `:max-depth`, если передан, должен быть положительным целым числом; `:logger`, если передан, должен быть функцией |
+| `publish!` | `event-type` должен быть keyword; `opts` должен быть картой; `:module` обязателен; `:parent-envelope`, если передан, должен иметь корректную форму |
+| `subscribe!` | `event-type` должен быть keyword; `handler` должен быть функцией; `opts`, если передан, должен быть картой |
+| `unsubscribe!` | `event-type` должен быть keyword; `matcher` должен быть строкой `subscription-id`, функцией обработчика или непустой картой для сверки `:meta` |
+| `listener-count` | `event-type`, если передан, должен быть keyword |
+
+Минимальная корректная форма `:parent-envelope`:
+
+```clojure
+{:module :booking
+ :event-type :booking/created
+ :correlation-id "c-1"
+ :causation-path []}
+```
+
+`:causation-path` должен быть вектором. Каждый элемент пути должен быть
+векторной парой:
+
+```clojure
+[:booking :booking/created]
+```
+
+Первый элемент пары — идентификатор модуля, второй элемент — тип события.
+
 ## `unsubscribe!`
 
 Снимает подписку.
@@ -161,9 +215,9 @@
 
 `matcher` первой версии может быть:
 
-- `subscription-id`
-- handler function
-- `:meta` matcher map
+- `subscription-id`;
+- функция обработчика;
+- непустая карта для сверки `:meta`.
 
 Примеры:
 

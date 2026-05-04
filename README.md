@@ -9,6 +9,7 @@ Current first version keeps only the parts that matter for the frontend:
 - required `:module` on publish
 - `:parent-envelope` for derived events
 - `correlation-id` and `causation-path`
+- fail-fast validation of public API boundaries
 - handler error isolation
 
 It intentionally does not include server-side complexities like:

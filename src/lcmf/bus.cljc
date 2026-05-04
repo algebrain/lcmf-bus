@@ -20,6 +20,36 @@
     (throw (ex-info "Missing required :module in publish options"
                     {:reason :missing-module}))))
 
+(defn- invalid-argument! [field value]
+  (throw (ex-info "Invalid argument"
+                  {:reason :invalid-argument
+                   :field field
+                   :value (pr-str value)})))
+
+(defn- validate-argument! [value pred field]
+  (when-not (pred value)
+    (invalid-argument! field value)))
+
+(defn- valid-causation-step? [step]
+  (and (vector? step)
+       (= 2 (count step))
+       (some? (first step))
+       (keyword? (second step))))
+
+(defn- valid-parent-envelope? [parent-envelope]
+  (and (map? parent-envelope)
+       (some? (:module parent-envelope))
+       (keyword? (:event-type parent-envelope))
+       (some? (:correlation-id parent-envelope))
+       (vector? (:causation-path parent-envelope))
+       (every? valid-causation-step? (:causation-path parent-envelope))))
+
+(defn- validate-parent-envelope! [parent-envelope]
+  (when-not (valid-parent-envelope? parent-envelope)
+    (throw (ex-info "Invalid parent envelope"
+                    {:reason :invalid-parent-envelope
+                     :parent-envelope parent-envelope}))))
+
 (defn- listener-entries [bus event-type]
   (get @(:listeners bus) event-type []))
 
@@ -66,6 +96,10 @@
 
 (defn make-bus
   [& {:as opts}]
+  (when (contains? opts :max-depth)
+    (validate-argument! (:max-depth opts) (every-pred integer? pos?) :max-depth))
+  (when (contains? opts :logger)
+    (validate-argument! (:logger opts) fn? :logger))
   {:opts opts
    :listeners (atom {})})
 
@@ -73,6 +107,10 @@
   ([bus event-type handler]
    (subscribe! bus event-type handler nil))
   ([bus event-type handler opts]
+   (validate-argument! event-type keyword? :event-type)
+   (validate-argument! handler fn? :handler)
+   (when opts
+     (validate-argument! opts map? :opts))
    (let [subscription-id (new-id)
          entry {:id subscription-id
                 :handler handler
@@ -84,8 +122,16 @@
   [expected actual]
   (every? (fn [[k v]] (= v (get actual k))) expected))
 
+(defn- valid-matcher? [matcher]
+  (or (string? matcher)
+      (fn? matcher)
+      (and (map? matcher)
+           (seq matcher))))
+
 (defn unsubscribe!
   [bus event-type matcher]
+  (validate-argument! event-type keyword? :event-type)
+  (validate-argument! matcher valid-matcher? :matcher)
   (let [removed? (atom false)]
     (swap! (:listeners bus)
            update
@@ -109,11 +155,16 @@
   ([bus]
    (reduce + 0 (map count (vals @(:listeners bus)))))
   ([bus event-type]
+   (validate-argument! event-type keyword? :event-type)
    (count (listener-entries bus event-type))))
 
 (defn publish!
-  [bus event-type payload {:keys [module] :as opts}]
+  [bus event-type payload {:keys [module parent-envelope] :as opts}]
+  (validate-argument! event-type keyword? :event-type)
+  (validate-argument! opts map? :opts)
   (ensure-module! module)
+  (when parent-envelope
+    (validate-parent-envelope! parent-envelope))
   (let [envelope (make-envelope bus event-type payload opts)
         handlers (vec (listener-entries bus event-type))]
     (log! bus :info {:event :event-published

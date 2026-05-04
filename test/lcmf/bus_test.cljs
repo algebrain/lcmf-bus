@@ -116,3 +116,161 @@
                                           (throw (ex-info "logger boom" {})))))]
     (is (map?
          (bus/publish! app-bus :event/log nil {:module :test})))))
+
+(deftest publish-rejects-invalid-boundary-arguments-test
+  (let [app-bus (bus/make-bus)]
+    (doseq [[label f expected-field]
+            [[:event-type #(bus/publish! app-bus "booking/created" {} {:module :booking}) :event-type]
+             [:opts #(bus/publish! app-bus :booking/created {} "not-a-map") :opts]]]
+      (let [ex (thrown-ex f)]
+        (is (some? ex) label)
+        (is (= :invalid-argument (:reason (ex-data ex))) label)
+        (is (= expected-field (:field (ex-data ex))) label)))))
+
+(deftest publish-rejects-invalid-parent-envelope-test
+  (let [app-bus (bus/make-bus)
+        cases [[:missing-module
+                {:event-type :booking/created
+                 :correlation-id "c-1"
+                 :causation-path []}]
+               [:missing-event-type
+                {:module :booking
+                 :correlation-id "c-1"
+                 :causation-path []}]
+               [:missing-correlation-id
+                {:module :booking
+                 :event-type :booking/created
+                 :causation-path []}]
+               [:non-vector-causation-path
+                {:module :booking
+                 :event-type :booking/created
+                 :correlation-id "c-1"
+                 :causation-path "bad"}]
+               [:bad-causation-path-step
+                {:module :booking
+                 :event-type :booking/created
+                 :correlation-id "c-1"
+                 :causation-path [[:accounts :signed-in]
+                                  [:bad-step]]}]]]
+    (doseq [[label parent-envelope] cases]
+      (let [ex (thrown-ex #(bus/publish! app-bus
+                                         :notify/booking-created
+                                         {}
+                                         {:module :notify
+                                          :parent-envelope parent-envelope}))]
+        (is (some? ex) label)
+        (is (= :invalid-parent-envelope (:reason (ex-data ex))) label)))))
+
+(deftest subscribe-rejects-invalid-boundary-arguments-test
+  (let [app-bus (bus/make-bus)]
+    (doseq [[label f expected-field]
+            [[:event-type #(bus/subscribe! app-bus "booking/created" (fn [_ _])) :event-type]
+             [:handler #(bus/subscribe! app-bus :booking/created :not-a-fn) :handler]
+             [:opts #(bus/subscribe! app-bus :booking/created (fn [_ _]) "not-a-map") :opts]]]
+      (let [ex (thrown-ex f)]
+        (is (some? ex) label)
+        (is (= :invalid-argument (:reason (ex-data ex))) label)
+        (is (= expected-field (:field (ex-data ex))) label)))))
+
+(deftest make-bus-rejects-invalid-options-test
+  (doseq [[label f expected-field]
+          [[:max-depth #(bus/make-bus :max-depth "8") :max-depth]
+           [:logger #(bus/make-bus :logger :not-a-fn) :logger]]]
+    (let [ex (thrown-ex f)]
+      (is (some? ex) label)
+      (is (= :invalid-argument (:reason (ex-data ex))) label)
+      (is (= expected-field (:field (ex-data ex))) label))))
+
+(deftest unsubscribe-and-listener-count-reject-invalid-arguments-test
+  (let [app-bus (bus/make-bus)
+        ex-event (thrown-ex #(bus/unsubscribe! app-bus "event/inc" "sub-1"))
+        ex-matcher (thrown-ex #(bus/unsubscribe! app-bus :event/inc 42))
+        ex-empty-matcher (thrown-ex #(bus/unsubscribe! app-bus :event/inc {}))
+        ex-count (thrown-ex #(bus/listener-count app-bus "event/inc"))]
+    (is (= :invalid-argument (:reason (ex-data ex-event))))
+    (is (= :event-type (:field (ex-data ex-event))))
+    (is (= :invalid-argument (:reason (ex-data ex-matcher))))
+    (is (= :matcher (:field (ex-data ex-matcher))))
+    (is (= :invalid-argument (:reason (ex-data ex-empty-matcher))))
+    (is (= :matcher (:field (ex-data ex-empty-matcher))))
+    (is (= :invalid-argument (:reason (ex-data ex-count))))
+    (is (= :event-type (:field (ex-data ex-count))))))
+
+(deftest explicit-correlation-id-and-nested-causation-test
+  (let [app-bus (bus/make-bus)
+        root (bus/publish! app-bus
+                           :booking/created
+                           {:id "b-1"}
+                           {:module :booking
+                            :correlation-id "c-1"})
+        first-child (bus/publish! app-bus
+                                  :notify/booking-created
+                                  {:booking-id "b-1"}
+                                  {:module :notify
+                                   :parent-envelope root})
+        second-child (bus/publish! app-bus
+                                   :audit/notification-created
+                                   {:booking-id "b-1"}
+                                   {:module :audit
+                                    :parent-envelope first-child})]
+    (is (= "c-1" (:correlation-id root)))
+    (is (= "c-1" (:correlation-id first-child)))
+    (is (= "c-1" (:correlation-id second-child)))
+    (is (= [] (:causation-path root)))
+    (is (= [[:booking :booking/created]]
+           (:causation-path first-child)))
+    (is (= [[:booking :booking/created]
+            [:notify :notify/booking-created]]
+           (:causation-path second-child)))))
+
+(deftest logger-failure-on-handler-error-does-not-break-publish-test
+  (let [app-bus (bus/make-bus :logger (fn [_level data]
+                                        (when (= :handler-failed (:event data))
+                                          (throw (ex-info "logger boom" {})))))
+        calls (atom [])]
+    (bus/subscribe! app-bus :event/log
+                    (fn [_ _]
+                      (swap! calls conj :bad)
+                      (throw (ex-info "handler boom" {}))))
+    (bus/subscribe! app-bus :event/log
+                    (fn [_ _]
+                      (swap! calls conj :good)))
+    (is (map? (bus/publish! app-bus :event/log nil {:module :test})))
+    (is (= [:bad :good] @calls))))
+
+(deftest module-chain-integration-test
+  (let [app-bus (bus/make-bus)
+        audit (atom [])]
+    (bus/subscribe! app-bus :booking/created
+                    (fn [_ _]
+                      (throw (ex-info "audit sibling failed" {}))))
+    (bus/subscribe! app-bus :booking/created
+                    (fn [b envelope]
+                      (bus/publish! b
+                                    :notify/booking-created
+                                    {:booking-id (get-in envelope [:payload :id])}
+                                    {:module :notify
+                                     :parent-envelope envelope})))
+    (bus/subscribe! app-bus :booking/created
+                    (fn [_ envelope]
+                      (swap! audit conj [:booking envelope])))
+    (bus/subscribe! app-bus :notify/booking-created
+                    (fn [_ envelope]
+                      (swap! audit conj [:notify envelope])))
+    (let [root (bus/publish! app-bus
+                             :booking/created
+                             {:id "b-1"}
+                             {:module :booking
+                              :correlation-id "c-1"})
+          booking-envelope (some (fn [[label envelope]]
+                                   (when (= :booking label)
+                                     envelope))
+                                 @audit)
+          notify-envelope (some (fn [[label envelope]]
+                                  (when (= :notify label)
+                                    envelope))
+                                @audit)]
+      (is (= root booking-envelope))
+      (is (= "c-1" (:correlation-id notify-envelope)))
+      (is (= [[:booking :booking/created]]
+             (:causation-path notify-envelope))))))
